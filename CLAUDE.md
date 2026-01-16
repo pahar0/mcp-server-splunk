@@ -11,28 +11,29 @@ This is a Model Context Protocol (MCP) server that provides 50+ tools for intera
 ### Setup and Installation
 
 ```bash
-# Install dependencies
+# Install with uv (recommended)
+uv pip install -e .
+
+# Or install dependencies only
 pip install -r requirements.txt
-# or with uv (recommended)
-uv pip install -r requirements.txt
 ```
 
 ### Running the MCP Server
 
 ```bash
-# Development mode with MCP Inspector
-uv run mcp dev splunk_mcp_server.py
+# Using installed command
+mcp-server-splunk
 
-# Direct execution
-python splunk_mcp_server.py
+# Or via uv
+uv run mcp-server-splunk
 
-# Install in Claude Desktop
-uv run mcp install splunk_mcp_server.py
+# Debug with MCP Inspector
+npx @modelcontextprotocol/inspector uv run mcp-server-splunk
 ```
 
 ### Configuration
 
-The server requires environment variables for Splunk connection. Copy `.env.example` to `.env` and configure:
+The server requires environment variables for Splunk connection (passed via MCP client config):
 - `SPLUNK_HOST`: Splunk server hostname (default: localhost)
 - `SPLUNK_PORT`: Management port (default: 8089)
 - `SPLUNK_SCHEME`: Connection scheme (http/https, default: https)
@@ -43,7 +44,7 @@ The server requires environment variables for Splunk connection. Copy `.env.exam
 
 ### Core Components
 
-**Connection Management** (`get_splunk_service()` at line 39)
+**Connection Management** (`get_splunk_service()`)
 - Singleton pattern for Splunk service connections
 - Supports both token-based and username/password authentication
 - Token authentication takes precedence if both are configured
@@ -55,22 +56,25 @@ The server requires environment variables for Splunk connection. Copy `.env.exam
 - Tools return dictionaries with `success`, `error`, and result data fields
 - Consistent error handling pattern across all tools
 
+**Entry Point**
+- `main()` function at end of file for package entry point
+- Defined in `pyproject.toml` as `mcp-server-splunk = "splunk_mcp_server:main"`
+
 ### Tool Categories
 
 The 50+ tools are organized into these functional groups:
 
-1. **Search & Query** (lines 73-287): Execute SPL queries, run saved searches, retrieve results
-2. **Index Management** (lines 150-183, 499-543): List indexes, get index details, retrieve statistics
-3. **Alert Management** (lines 682-923): CRUD operations for alerts, view alert history
-4. **Dashboard Operations** (lines 930-1079): Create/read/delete dashboards, manage XML content
-5. **Knowledge Objects** (lines 1086-1280): Lookups, field extractions, data models
-6. **Data Input Management** (lines 1287-1452): Monitor file inputs, network inputs, scripts
-7. **User & Access Management** (lines 1459-1614): Users, roles, capabilities, permissions
-8. **KV Store Operations** (lines 1621-1851): NoSQL-style storage with CRUD operations
-9. **Data Model Tools** (lines 1858-2057): Accelerated data model searches using tstats
-10. **Job Management** (lines 2064-2176): Monitor and control search jobs
-11. **Search Macros** (lines 2183-2427): Reusable search components
-12. **Server Administration** (lines 2434-2783): Server messages, settings, restart checks
+1. **Search & Query**: Execute SPL queries, run saved searches, retrieve results
+2. **Index Management**: List indexes, get index details, create/update/delete indexes
+3. **Alert Management**: CRUD operations for alerts, view alert history
+4. **Dashboard Operations**: Create/read/delete dashboards, manage XML content
+5. **Knowledge Objects**: Lookups, field extractions, macros, data models
+6. **Data Input Management**: Monitor file inputs, network inputs
+7. **User & Access Management**: Users, roles, capabilities, permissions
+8. **KV Store Operations**: NoSQL-style storage with CRUD operations
+9. **Data Model Tools**: Accelerated data model searches using tstats
+10. **Job Management**: Monitor and control search jobs
+11. **Server Administration**: Server messages, settings, restart, refresh
 
 ### Key Design Patterns
 
@@ -91,38 +95,36 @@ The 50+ tools are organized into these functional groups:
 - Generic exceptions are caught and returned in `error` field
 - No exceptions propagate to the MCP layer
 
-**Data Serialization**
-- REST API responses are parsed from JSON when needed
-- Some endpoints return JSON-encoded strings that require double parsing
-- CSV data for lookups is manually constructed from dictionaries
-- Dashboard XML is passed directly without CDATA wrappers
+**Restart Notification**
+- `delete_app()` checks `service.restart_required` after deletion
+- Returns `restart_required` and `note` fields when restart is needed
 
 ## Special Considerations
 
 ### Query Auto-Prefixing
-The `search_splunk()` tool automatically prefixes queries with `search` if they don't start with recognized commands (`search`, `|`, `from`, `tstats`, `inputlookup`). This is at line 95.
+The `search_splunk()` tool automatically prefixes queries with `search` if they don't start with recognized commands (`search`, `|`, `from`, `tstats`, `inputlookup`).
 
 ### Dashboard XML Format
-When creating dashboards via `create_dashboard()`, pass plain XML without CDATA wrappers. The XML must include a `<label>` tag. The tool uses `eai:data` parameter for the XML content (line 1037).
+When creating dashboards via `create_dashboard()`, pass plain XML without CDATA wrappers. The XML must include a `<label>` tag.
 
 ### KV Store Operations
 KV Store collections use MongoDB-style query syntax. The SDK provides a `.data` property on collections for CRUD operations:
 - `collection.data.query(**params)` for queries
 - `collection.data.insert(data)` for inserts
 - `collection.data.update(key, data)` for updates
-- Direct REST API call for deletes (line 1832)
+- Direct REST API call for deletes
 
 ### Lookup Table Updates
-The `update_lookup_data()` tool replaces ALL existing data in the lookup table. It converts the list of dictionaries to CSV format manually (lines 1204-1212) before posting to the REST API.
+The `update_lookup_data()` tool replaces ALL existing data in the lookup table. It converts the list of dictionaries to CSV format before posting to the REST API.
 
-### Large Response Mitigation
-Some tools like `get_data_model()` accept a `summary_only` parameter (default: True) to avoid returning massive JSON payloads. Always use summary mode unless full details are explicitly needed.
+### Server Restart vs Refresh
+- `restart_splunk()`: Full splunkd restart using `service.restart()`
+- `refresh_splunk()`: Reload configs without restart using `/services/apps/local/_reload`
 
 ## Dependencies
 
-- **mcp[cli]**: FastMCP framework for building MCP servers
+- **mcp**: FastMCP framework for building MCP servers
 - **splunk-sdk**: Official Splunk Python SDK for REST API interaction
-- **python-dotenv**: Environment variable management from .env files
 
 ## Python Version
 
