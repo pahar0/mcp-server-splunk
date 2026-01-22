@@ -101,15 +101,16 @@ mcp:
 - `get_alert_history`
 
 ### Saved Searches
-- `list_saved_searches` / `create_saved_search` / `update_saved_search` / `delete_saved_search`
+- `list_saved_searches` / `get_saved_search` / `run_saved_search`
+- `create_saved_search` / `update_saved_search` / `delete_saved_search`
 
 ### Dashboards
 - `list_dashboards` / `get_dashboard` / `create_dashboard` / `delete_dashboard`
 
 ### Knowledge Objects
 - `list_lookups` / `get_lookup_data` / `update_lookup_data`
-- `list_macros` / `create_macro` / `update_macro` / `delete_macro`
-- `list_field_extractions`
+- `list_macros` / `get_macro` / `create_macro` / `update_macro` / `delete_macro`
+- `list_field_extractions` / `get_field_summary`
 
 ### KV Store
 - `list_kvstore_collections` / `create_kvstore_collection` / `delete_kvstore_collection`
@@ -129,7 +130,7 @@ mcp:
 ### Server
 - `get_server_info` / `get_server_settings`
 - `check_restart_required` / `restart_splunk` / `refresh_splunk`
-- `list_jobs` / `get_job_results` / `cancel_job`
+- `list_jobs` / `get_job_status` / `get_job_results` / `cancel_job`
 
 ## Example Prompts
 

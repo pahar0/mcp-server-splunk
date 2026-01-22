@@ -82,6 +82,7 @@ The 50+ tools are organized into these functional groups:
 - Many operations set `service.namespace['app']` to control app context
 - Default app is typically "search" but can be specified per operation
 - Owner defaults to "-" (all users) or "nobody" (global scope)
+- Many tools accept an optional `app` parameter for filtering (saved searches, alerts, lookups, macros)
 
 **Job Lifecycle**
 - Search operations create jobs via `service.jobs.create()`
@@ -120,6 +121,9 @@ The `update_lookup_data()` tool replaces ALL existing data in the lookup table. 
 ### Server Restart vs Refresh
 - `restart_splunk()`: Full splunkd restart using `service.restart()`
 - `refresh_splunk()`: Reload configs without restart using `/services/apps/local/_reload`
+
+### Field Summary
+The `get_field_summary()` tool provides introspection into an index's fields, types, and sample values. Useful for understanding data structure before writing SPL queries.
 
 ## Dependencies
 
