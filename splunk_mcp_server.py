@@ -484,9 +484,12 @@ def list_indexes() -> dict[str, Any]:
 
 
 @mcp.tool()
-def list_saved_searches() -> dict[str, Any]:
+def list_saved_searches(app: str | None = None) -> dict[str, Any]:
     """
     List all saved searches (reports and alerts) in Splunk.
+
+    Args:
+        app: Optional app context to filter saved searches (default: all apps)
 
     Returns:
         Dictionary containing list of saved searches with their properties
@@ -494,11 +497,16 @@ def list_saved_searches() -> dict[str, Any]:
     service = get_splunk_service()
 
     try:
+        if app:
+            service.namespace['app'] = app
+
         saved_searches = []
         for saved_search in service.saved_searches:
+            if app and saved_search.access.app != app:
+                continue
             saved_searches.append({
                 "name": saved_search.name,
-                "search": saved_search.content.get("search", ""),
+                "app": saved_search.access.app,
                 "is_scheduled": saved_search.content.get("is_scheduled", False),
                 "cron_schedule": saved_search.content.get("cron_schedule", ""),
                 "earliest_time": saved_search.content.get("dispatch.earliest_time", ""),
@@ -521,12 +529,13 @@ def list_saved_searches() -> dict[str, Any]:
 
 
 @mcp.tool()
-def run_saved_search(name: str, max_count: int = 100) -> dict[str, Any]:
+def run_saved_search(name: str, app: str | None = None, max_count: int = 100) -> dict[str, Any]:
     """
     Execute a saved search by name and return its results.
 
     Args:
         name: Name of the saved search to execute
+        app: Optional app context to find the saved search in (default: first match)
         max_count: Maximum number of results to return (default: 100)
 
     Returns:
@@ -535,8 +544,18 @@ def run_saved_search(name: str, max_count: int = 100) -> dict[str, Any]:
     service = get_splunk_service()
 
     try:
+        if app:
+            service.namespace['app'] = app
         # Get the saved search
         saved_search = service.saved_searches[name]
+
+        # Validate app matches if specified
+        if app and saved_search.access.app != app:
+            return {
+                "success": False,
+                "error": f"Saved search '{name}' not found in app '{app}'",
+                "results": []
+            }
 
         # Dispatch the saved search
         job = saved_search.dispatch()
@@ -574,9 +593,12 @@ def run_saved_search(name: str, max_count: int = 100) -> dict[str, Any]:
         }
 
     except KeyError:
+        error_msg = f"Saved search '{name}' not found"
+        if app:
+            error_msg += f" in app '{app}'"
         return {
             "success": False,
-            "error": f"Saved search '{name}' not found",
+            "error": error_msg,
             "results": []
         }
     except Exception as e:
@@ -588,12 +610,13 @@ def run_saved_search(name: str, max_count: int = 100) -> dict[str, Any]:
 
 
 @mcp.tool()
-def get_saved_search(name: str) -> dict[str, Any]:
+def get_saved_search(name: str, app: str | None = None) -> dict[str, Any]:
     """
     Get detailed information about a specific saved search.
 
     Args:
         name: Name of the saved search to retrieve
+        app: Optional app context to find the saved search in (default: first match)
 
     Returns:
         Dictionary containing saved search details
@@ -601,7 +624,16 @@ def get_saved_search(name: str) -> dict[str, Any]:
     service = get_splunk_service()
 
     try:
+        if app:
+            service.namespace['app'] = app
         saved_search = service.saved_searches[name]
+
+        # Validate app matches if specified
+        if app and saved_search.access.app != app:
+            return {
+                "success": False,
+                "error": f"Saved search '{name}' not found in app '{app}'"
+            }
 
         return {
             "success": True,
@@ -625,9 +657,12 @@ def get_saved_search(name: str) -> dict[str, Any]:
         }
 
     except KeyError:
+        error_msg = f"Saved search '{name}' not found"
+        if app:
+            error_msg += f" in app '{app}'"
         return {
             "success": False,
-            "error": f"Saved search '{name}' not found"
+            "error": error_msg
         }
     except Exception as e:
         return {
@@ -640,6 +675,7 @@ def get_saved_search(name: str) -> dict[str, Any]:
 def create_saved_search(
     name: str,
     search: str,
+    app: str | None = None,
     description: Optional[str] = None,
     is_scheduled: bool = False,
     cron_schedule: Optional[str] = None,
@@ -652,6 +688,7 @@ def create_saved_search(
     Args:
         name: Name of the saved search
         search: SPL search query
+        app: Optional app context to create the saved search in (default: search)
         description: Optional description of the saved search
         is_scheduled: Whether to schedule the search (default: False)
         cron_schedule: Cron schedule for running the search (e.g., '0 */4 * * *')
@@ -669,6 +706,9 @@ def create_saved_search(
     service = get_splunk_service()
 
     try:
+        if app:
+            service.namespace['app'] = app
+
         # Prepare saved search configuration
         config = {
             "search": search,
@@ -706,6 +746,7 @@ def create_saved_search(
 @mcp.tool()
 def update_saved_search(
     name: str,
+    app: str | None = None,
     search: Optional[str] = None,
     description: Optional[str] = None,
     is_scheduled: Optional[bool] = None,
@@ -718,6 +759,7 @@ def update_saved_search(
 
     Args:
         name: Name of the saved search to update
+        app: Optional app context to find the saved search in (default: first match)
         search: Optional new SPL search query
         description: Optional new description
         is_scheduled: Optional enable/disable scheduling
@@ -736,7 +778,16 @@ def update_saved_search(
     service = get_splunk_service()
 
     try:
+        if app:
+            service.namespace['app'] = app
         saved_search = service.saved_searches[name]
+
+        # Validate app matches if specified
+        if app and saved_search.access.app != app:
+            return {
+                "success": False,
+                "error": f"Saved search '{name}' not found in app '{app}'"
+            }
 
         # Update only provided fields
         update_dict = {}
@@ -761,9 +812,12 @@ def update_saved_search(
         }
 
     except KeyError:
+        error_msg = f"Saved search '{name}' not found"
+        if app:
+            error_msg += f" in app '{app}'"
         return {
             "success": False,
-            "error": f"Saved search '{name}' not found"
+            "error": error_msg
         }
     except Exception as e:
         return {
@@ -773,12 +827,13 @@ def update_saved_search(
 
 
 @mcp.tool()
-def delete_saved_search(name: str) -> dict[str, Any]:
+def delete_saved_search(name: str, app: str | None = None) -> dict[str, Any]:
     """
     Delete a saved search from Splunk.
 
     Args:
         name: Name of the saved search to delete
+        app: Optional app context to find the saved search in (default: first match)
 
     Returns:
         Dictionary indicating success or failure
@@ -786,7 +841,17 @@ def delete_saved_search(name: str) -> dict[str, Any]:
     service = get_splunk_service()
 
     try:
+        if app:
+            service.namespace['app'] = app
         saved_search = service.saved_searches[name]
+
+        # Validate app matches if specified
+        if app and saved_search.access.app != app:
+            return {
+                "success": False,
+                "error": f"Saved search '{name}' not found in app '{app}'"
+            }
+
         saved_search.delete()
 
         return {
@@ -795,9 +860,12 @@ def delete_saved_search(name: str) -> dict[str, Any]:
         }
 
     except KeyError:
+        error_msg = f"Saved search '{name}' not found"
+        if app:
+            error_msg += f" in app '{app}'"
         return {
             "success": False,
-            "error": f"Saved search '{name}' not found"
+            "error": error_msg
         }
     except Exception as e:
         return {
@@ -1345,9 +1413,12 @@ def get_server_info() -> dict[str, Any]:
 # ============================================================================
 
 @mcp.tool()
-def list_alerts() -> dict[str, Any]:
+def list_alerts(app: str | None = None) -> dict[str, Any]:
     """
     List all triggered alerts in Splunk.
+
+    Args:
+        app: Optional app context to filter alerts (default: all apps)
 
     Returns:
         Dictionary containing list of triggered alerts with their properties
@@ -1355,10 +1426,17 @@ def list_alerts() -> dict[str, Any]:
     service = get_splunk_service()
 
     try:
+        if app:
+            service.namespace['app'] = app
+
         alerts = []
         for alert in service.fired_alerts:
+            alert_app = alert.access.app if hasattr(alert, 'access') else None
+            if app and alert_app and alert_app != app:
+                continue
             alerts.append({
                 "name": alert.name,
+                "app": alert_app,
                 "sid": alert.content.get("sid", ""),
                 "trigger_time": alert.content.get("trigger_time", ""),
                 "triggered_alerts": alert.content.get("triggered_alerts", 0),
@@ -1384,6 +1462,7 @@ def list_alerts() -> dict[str, Any]:
 def create_alert(
     name: str,
     search: str,
+    app: str | None = None,
     alert_type: str = "number of events",
     alert_comparator: str = "greater than",
     alert_threshold: str = "0",
@@ -1397,6 +1476,7 @@ def create_alert(
     Args:
         name: Name of the alert
         search: SPL search query for the alert
+        app: Optional app context to create the alert in (default: search)
         alert_type: Type of alert condition.
             Valid values: 'number of events', 'number of results', 'number of hosts', 'number of sources'
             (default: 'number of events')
@@ -1414,6 +1494,9 @@ def create_alert(
     service = get_splunk_service()
 
     try:
+        if app:
+            service.namespace['app'] = app
+
         # Prepare alert configuration
         alert_config = {
             "search": search,
@@ -1449,6 +1532,7 @@ def create_alert(
 @mcp.tool()
 def update_alert(
     name: str,
+    app: str | None = None,
     search: Optional[str] = None,
     alert_threshold: Optional[str] = None,
     cron_schedule: Optional[str] = None,
@@ -1460,6 +1544,7 @@ def update_alert(
 
     Args:
         name: Name of the alert to update
+        app: Optional app context to find the alert in (default: first match)
         search: Optional new SPL search query
         alert_threshold: Optional new threshold value
         cron_schedule: Optional new cron schedule
@@ -1472,7 +1557,16 @@ def update_alert(
     service = get_splunk_service()
 
     try:
+        if app:
+            service.namespace['app'] = app
         alert = service.saved_searches[name]
+
+        # Validate app matches if specified
+        if app and alert.access.app != app:
+            return {
+                "success": False,
+                "error": f"Alert '{name}' not found in app '{app}'"
+            }
 
         # Update only provided fields
         update_dict = {}
@@ -1495,9 +1589,12 @@ def update_alert(
         }
 
     except KeyError:
+        error_msg = f"Alert '{name}' not found"
+        if app:
+            error_msg += f" in app '{app}'"
         return {
             "success": False,
-            "error": f"Alert '{name}' not found"
+            "error": error_msg
         }
     except Exception as e:
         return {
@@ -1507,12 +1604,13 @@ def update_alert(
 
 
 @mcp.tool()
-def delete_alert(name: str) -> dict[str, Any]:
+def delete_alert(name: str, app: str | None = None) -> dict[str, Any]:
     """
     Delete an alert from Splunk.
 
     Args:
         name: Name of the alert to delete
+        app: Optional app context to find the alert in (default: first match)
 
     Returns:
         Dictionary indicating success or failure
@@ -1520,7 +1618,17 @@ def delete_alert(name: str) -> dict[str, Any]:
     service = get_splunk_service()
 
     try:
+        if app:
+            service.namespace['app'] = app
         alert = service.saved_searches[name]
+
+        # Validate app matches if specified
+        if app and alert.access.app != app:
+            return {
+                "success": False,
+                "error": f"Alert '{name}' not found in app '{app}'"
+            }
+
         alert.delete()
 
         return {
@@ -1529,9 +1637,12 @@ def delete_alert(name: str) -> dict[str, Any]:
         }
 
     except KeyError:
+        error_msg = f"Alert '{name}' not found"
+        if app:
+            error_msg += f" in app '{app}'"
         return {
             "success": False,
-            "error": f"Alert '{name}' not found"
+            "error": error_msg
         }
     except Exception as e:
         return {
@@ -1541,7 +1652,7 @@ def delete_alert(name: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def get_alert_history(name: str, max_count: int = 50) -> dict[str, Any]:
+def get_alert_history(name: str, app: str | None = None, max_count: int = 50) -> dict[str, Any]:
     """
     Get the firing history of an alert.
 
@@ -1551,6 +1662,7 @@ def get_alert_history(name: str, max_count: int = 50) -> dict[str, Any]:
 
     Args:
         name: Name of the alert
+        app: Optional app context to filter alert history (default: all apps)
         max_count: Maximum number of history entries to return
 
     Returns:
@@ -1561,6 +1673,8 @@ def get_alert_history(name: str, max_count: int = 50) -> dict[str, Any]:
     try:
         # Search for alert actions in the _audit index
         query = f'search index=_audit action="alert_fired" savedsearch_name="{name}"'
+        if app:
+            query += f' app="{app}"'
         job = service.jobs.create(
             query,
             earliest_time="-7d",
@@ -1817,12 +1931,13 @@ def list_lookups(app: str = "-") -> dict[str, Any]:
 
 
 @mcp.tool()
-def get_lookup_data(lookup_name: str, max_rows: int = 1000) -> dict[str, Any]:
+def get_lookup_data(lookup_name: str, app: str | None = None, max_rows: int = 1000) -> dict[str, Any]:
     """
     Retrieve data from a lookup table.
 
     Args:
         lookup_name: Name of the lookup table file
+        app: Optional app context to find the lookup in (default: search order)
         max_rows: Maximum number of rows to return (default: 1000)
 
     Returns:
@@ -1831,6 +1946,9 @@ def get_lookup_data(lookup_name: str, max_rows: int = 1000) -> dict[str, Any]:
     service = get_splunk_service()
 
     try:
+        if app:
+            service.namespace['app'] = app
+
         # Use inputlookup to retrieve data
         query = f"| inputlookup {lookup_name}"
         job = service.jobs.create(query, max_count=max_rows)
@@ -4785,6 +4903,521 @@ def refresh_splunk() -> dict[str, Any]:
         return {
             "success": False,
             "error": str(e)
+        }
+
+
+# ============================================================================
+# Macro Management Tools
+# ============================================================================
+
+@mcp.tool()
+def list_macros(app: str | None = None) -> dict[str, Any]:
+    """
+    List all search macros in Splunk.
+
+    Args:
+        app: Optional app context to filter macros (default: all apps)
+
+    Returns:
+        Dictionary containing list of macros with their properties
+    """
+    service = get_splunk_service()
+
+    try:
+        # Use REST API to get macros
+        params = {"count": -1, "output_mode": "json"}
+        if app:
+            endpoint = f"/servicesNS/-/{app}/data/macros"
+        else:
+            endpoint = "/servicesNS/-/-/data/macros"
+
+        response = service.get(endpoint, **params)
+        data = json.loads(response.body.read().decode('utf-8'))
+
+        macros = []
+        for entry in data.get('entry', []):
+            macro_app = entry.get('acl', {}).get('app', '')
+            if app and macro_app != app:
+                continue
+            macros.append({
+                "name": entry.get('name'),
+                "app": macro_app,
+                "definition": entry.get('content', {}).get('definition', ''),
+                "args": entry.get('content', {}).get('args', ''),
+                "owner": entry.get('acl', {}).get('owner', ''),
+                "sharing": entry.get('acl', {}).get('sharing', '')
+            })
+
+        return {
+            "success": True,
+            "macros": macros,
+            "count": len(macros)
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "macros": []
+        }
+
+
+@mcp.tool()
+def get_macro(name: str, app: str | None = None) -> dict[str, Any]:
+    """
+    Get detailed information about a specific macro.
+
+    Args:
+        name: Name of the macro to retrieve
+        app: Optional app context to find the macro in (default: first match)
+
+    Returns:
+        Dictionary containing macro details
+    """
+    service = get_splunk_service()
+
+    try:
+        if app:
+            endpoint = f"/servicesNS/-/{app}/data/macros/{name}"
+        else:
+            endpoint = f"/servicesNS/-/-/data/macros/{name}"
+
+        response = service.get(endpoint, output_mode="json")
+        data = json.loads(response.body.read().decode('utf-8'))
+
+        if not data.get('entry'):
+            return {
+                "success": False,
+                "error": f"Macro '{name}' not found"
+            }
+
+        entry = data['entry'][0]
+        macro_app = entry.get('acl', {}).get('app', '')
+
+        # Validate app matches if specified
+        if app and macro_app != app:
+            return {
+                "success": False,
+                "error": f"Macro '{name}' not found in app '{app}'"
+            }
+
+        return {
+            "success": True,
+            "macro": {
+                "name": entry.get('name'),
+                "app": macro_app,
+                "definition": entry.get('content', {}).get('definition', ''),
+                "args": entry.get('content', {}).get('args', ''),
+                "validation": entry.get('content', {}).get('validation', ''),
+                "errormsg": entry.get('content', {}).get('errormsg', ''),
+                "owner": entry.get('acl', {}).get('owner', ''),
+                "sharing": entry.get('acl', {}).get('sharing', '')
+            }
+        }
+
+    except Exception as e:
+        error_msg = str(e)
+        if "HTTP 404" in error_msg:
+            error_msg = f"Macro '{name}' not found"
+            if app:
+                error_msg += f" in app '{app}'"
+        return {
+            "success": False,
+            "error": error_msg
+        }
+
+
+@mcp.tool()
+def create_macro(
+    name: str,
+    definition: str,
+    app: str = "search",
+    args: str | None = None,
+    validation: str | None = None,
+    errormsg: str | None = None
+) -> dict[str, Any]:
+    """
+    Create a new search macro in Splunk.
+
+    Args:
+        name: Name of the macro (use $arg$ for arguments, e.g., 'mymacro(1)')
+        definition: The SPL definition of the macro
+        app: App to create the macro in (default: search)
+        args: Comma-separated list of argument names (e.g., 'arg1,arg2')
+        validation: Optional validation expression
+        errormsg: Optional error message when validation fails
+
+    Returns:
+        Dictionary indicating success or failure
+    """
+    service = get_splunk_service()
+
+    try:
+        endpoint = f"/servicesNS/nobody/{app}/data/macros"
+
+        params = {
+            "name": name,
+            "definition": definition,
+            "output_mode": "json"
+        }
+
+        if args:
+            params["args"] = args
+        if validation:
+            params["validation"] = validation
+        if errormsg:
+            params["errormsg"] = errormsg
+
+        service.post(endpoint, **params)
+
+        return {
+            "success": True,
+            "message": f"Macro '{name}' created successfully in app '{app}'",
+            "macro_name": name,
+            "app": app
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+def update_macro(
+    name: str,
+    app: str | None = None,
+    definition: str | None = None,
+    args: str | None = None,
+    validation: str | None = None,
+    errormsg: str | None = None
+) -> dict[str, Any]:
+    """
+    Update an existing search macro in Splunk.
+
+    Args:
+        name: Name of the macro to update
+        app: Optional app context to find the macro in (default: first match)
+        definition: New SPL definition
+        args: New comma-separated list of argument names
+        validation: New validation expression
+        errormsg: New error message for validation
+
+    Returns:
+        Dictionary indicating success or failure
+    """
+    service = get_splunk_service()
+
+    try:
+        # First, find the macro to get its app if not specified
+        if not app:
+            result = get_macro(name)
+            if not result['success']:
+                return result
+            app = result['macro']['app']
+
+        endpoint = f"/servicesNS/nobody/{app}/data/macros/{name}"
+
+        params = {"output_mode": "json"}
+        if definition is not None:
+            params["definition"] = definition
+        if args is not None:
+            params["args"] = args
+        if validation is not None:
+            params["validation"] = validation
+        if errormsg is not None:
+            params["errormsg"] = errormsg
+
+        if len(params) == 1:  # Only output_mode
+            return {
+                "success": False,
+                "error": "No update parameters provided"
+            }
+
+        service.post(endpoint, **params)
+
+        return {
+            "success": True,
+            "message": f"Macro '{name}' updated successfully"
+        }
+
+    except Exception as e:
+        error_msg = str(e)
+        if "HTTP 404" in error_msg:
+            error_msg = f"Macro '{name}' not found"
+            if app:
+                error_msg += f" in app '{app}'"
+        return {
+            "success": False,
+            "error": error_msg
+        }
+
+
+@mcp.tool()
+def delete_macro(name: str, app: str | None = None) -> dict[str, Any]:
+    """
+    Delete a search macro from Splunk.
+
+    Args:
+        name: Name of the macro to delete
+        app: Optional app context to find the macro in (default: first match)
+
+    Returns:
+        Dictionary indicating success or failure
+    """
+    service = get_splunk_service()
+
+    try:
+        # First, find the macro to get its app if not specified
+        if not app:
+            result = get_macro(name)
+            if not result['success']:
+                return result
+            app = result['macro']['app']
+
+        endpoint = f"/servicesNS/nobody/{app}/data/macros/{name}"
+        service.delete(endpoint)
+
+        return {
+            "success": True,
+            "message": f"Macro '{name}' deleted successfully"
+        }
+
+    except Exception as e:
+        error_msg = str(e)
+        if "HTTP 404" in error_msg:
+            error_msg = f"Macro '{name}' not found"
+            if app:
+                error_msg += f" in app '{app}'"
+        return {
+            "success": False,
+            "error": error_msg
+        }
+
+
+# ============================================================================
+# Job Management Tools
+# ============================================================================
+
+@mcp.tool()
+def list_jobs(app: str | None = None, owner: str | None = None) -> dict[str, Any]:
+    """
+    List all search jobs in Splunk.
+
+    Args:
+        app: Optional app context to filter jobs (default: all apps)
+        owner: Optional owner to filter jobs (default: all owners)
+
+    Returns:
+        Dictionary containing list of jobs with their properties
+    """
+    service = get_splunk_service()
+
+    try:
+        jobs = []
+        for job in service.jobs:
+            job_app = job.access.app if hasattr(job, 'access') else None
+            job_owner = job.access.owner if hasattr(job, 'access') else None
+
+            if app and job_app != app:
+                continue
+            if owner and job_owner != owner:
+                continue
+
+            jobs.append({
+                "sid": job.sid,
+                "app": job_app,
+                "owner": job_owner,
+                "search": job.content.get("search", "")[:200],  # Truncate long searches
+                "status": job.content.get("dispatchState", ""),
+                "is_done": job.is_done(),
+                "is_zombie": job.content.get("isZombie", False),
+                "run_duration": job.content.get("runDuration", ""),
+                "result_count": job.content.get("resultCount", 0),
+                "event_count": job.content.get("eventCount", 0),
+                "scan_count": job.content.get("scanCount", 0),
+                "earliest_time": job.content.get("earliestTime", ""),
+                "latest_time": job.content.get("latestTime", ""),
+                "create_time": job.content.get("createTime", "")
+            })
+
+        return {
+            "success": True,
+            "jobs": jobs,
+            "count": len(jobs)
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "jobs": []
+        }
+
+
+@mcp.tool()
+def get_job_status(sid: str) -> dict[str, Any]:
+    """
+    Get detailed status of a specific search job.
+
+    Args:
+        sid: Search ID (job ID) to check
+
+    Returns:
+        Dictionary containing job status and details
+    """
+    service = get_splunk_service()
+
+    try:
+        job = service.jobs[sid]
+        job.refresh()
+
+        return {
+            "success": True,
+            "job": {
+                "sid": job.sid,
+                "app": job.access.app if hasattr(job, 'access') else None,
+                "owner": job.access.owner if hasattr(job, 'access') else None,
+                "search": job.content.get("search", ""),
+                "status": job.content.get("dispatchState", ""),
+                "is_done": job.is_done(),
+                "is_zombie": job.content.get("isZombie", False),
+                "is_paused": job.content.get("isPaused", False),
+                "is_saved": job.content.get("isSaved", False),
+                "is_failed": job.content.get("isFailed", False),
+                "run_duration": job.content.get("runDuration", ""),
+                "result_count": job.content.get("resultCount", 0),
+                "event_count": job.content.get("eventCount", 0),
+                "scan_count": job.content.get("scanCount", 0),
+                "done_progress": job.content.get("doneProgress", 0),
+                "earliest_time": job.content.get("earliestTime", ""),
+                "latest_time": job.content.get("latestTime", ""),
+                "create_time": job.content.get("createTime", ""),
+                "priority": job.content.get("priority", ""),
+                "ttl": job.content.get("ttl", "")
+            }
+        }
+
+    except KeyError:
+        return {
+            "success": False,
+            "error": f"Job '{sid}' not found"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+def cancel_job(sid: str) -> dict[str, Any]:
+    """
+    Cancel a running search job.
+
+    Args:
+        sid: Search ID (job ID) to cancel
+
+    Returns:
+        Dictionary indicating success or failure
+    """
+    service = get_splunk_service()
+
+    try:
+        job = service.jobs[sid]
+        job.cancel()
+
+        return {
+            "success": True,
+            "message": f"Job '{sid}' cancelled successfully"
+        }
+
+    except KeyError:
+        return {
+            "success": False,
+            "error": f"Job '{sid}' not found"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+# ============================================================================
+# Field Summary Tools
+# ============================================================================
+
+@mcp.tool()
+def get_field_summary(
+    index: str,
+    earliest_time: str = "-24h",
+    latest_time: str = "now",
+    max_values: int = 10
+) -> dict[str, Any]:
+    """
+    Get a summary of fields available in an index, including field names,
+    types, and sample values. Useful for understanding data structure
+    before writing SPL queries.
+
+    Args:
+        index: Name of the index to analyze
+        earliest_time: Start of time range (default: -24h)
+        latest_time: End of time range (default: now)
+        max_values: Maximum distinct values to return per field (default: 10)
+
+    Returns:
+        Dictionary containing field summary with types and sample values
+    """
+    service = get_splunk_service()
+
+    try:
+        # Use fieldsummary command to get field information
+        query = f'search index={index} | head 10000 | fieldsummary maxvals={max_values}'
+        job = service.jobs.create(
+            query,
+            earliest_time=earliest_time,
+            latest_time=latest_time
+        )
+
+        while not job.is_done():
+            pass
+
+        result_stream = job.results(count=0)
+        reader = results.ResultsReader(result_stream)
+
+        fields = []
+        for result in reader:
+            if isinstance(result, dict):
+                fields.append({
+                    "field": result.get("field", ""),
+                    "count": result.get("count", 0),
+                    "distinct_count": result.get("distinct_count", 0),
+                    "is_exact": result.get("is_exact", ""),
+                    "numeric_count": result.get("numeric_count", 0),
+                    "min": result.get("min", ""),
+                    "max": result.get("max", ""),
+                    "mean": result.get("mean", ""),
+                    "stdev": result.get("stdev", ""),
+                    "values": result.get("values", "")
+                })
+
+        job.cancel()
+
+        return {
+            "success": True,
+            "index": index,
+            "time_range": {"earliest": earliest_time, "latest": latest_time},
+            "fields": fields,
+            "field_count": len(fields)
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "fields": []
         }
 
 
