@@ -4,6 +4,23 @@ A [Model Context Protocol](https://modelcontextprotocol.io/) server for Splunk. 
 
 ## Installation
 
+### Pi
+
+With Pi and `uv` installed, make `SPLUNK_TOKEN` available in the environment used to launch Pi, then register the server (replace the hostname):
+
+```bash
+pi mcp add splunk \
+  --env SPLUNK_HOST=your-splunk-host \
+  --env 'SPLUNK_TOKEN=${SPLUNK_TOKEN}' \
+  -- uvx --from git+https://github.com/pahar0/mcp-server-splunk.git mcp-server-splunk
+
+pi mcp list
+```
+
+This runs the repository version and saves the server in `~/.pi/agent/mcp.json`. The token is stored as an environment-variable reference, not its actual value. `pi mcp list` checks the MCP connection; Splunk authentication is checked when a tool is called.
+
+Start Pi with `pi`, or run `/reload` in an existing session after adding the server. Restart Pi if you changed its environment.
+
 ### Claude Desktop
 
 Add to your Claude Desktop config:
