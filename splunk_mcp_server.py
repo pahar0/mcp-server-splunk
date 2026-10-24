@@ -9,16 +9,27 @@ Provides tools for searching, managing indexes, and retrieving data from Splunk.
 import os
 import re
 import csv
+import ctypes
+import io
 import json
+import math
+import time
+from importlib.metadata import version
 from typing import Any, Optional
 from datetime import datetime
+from xml.etree import ElementTree
 
 import splunklib.client as client
 import splunklib.results as results
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
-# Initialize FastMCP server
-mcp = FastMCP("Splunk MCP Server")
+SERVER_VERSION = version("mcp-server-splunk")
+
+# Avoid the CSV reader's 128 KiB field cap; set the portable C-long limit once.
+csv.field_size_limit((1 << (8 * ctypes.sizeof(ctypes.c_long) - 1)) - 1)
+
+# Initialize MCP server
+mcp = MCPServer("Splunk MCP Server", version=SERVER_VERSION)
 
 # Splunk connection configuration
 SPLUNK_HOST = os.getenv("SPLUNK_HOST", "localhost")
@@ -63,12 +74,57 @@ def get_splunk_service() -> client.Service:
         raise ConnectionError(f"Failed to connect to Splunk: {str(e)}")
 
 
+def _validate_search_timeout(timeout_seconds: float | None) -> None:
+    if timeout_seconds is not None and (not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
+        raise ValueError("timeout_seconds must be a positive finite number or None")
+
+
+def _wait_for_search_job(job: client.Job, timeout_seconds: float | None) -> None:
+    deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+    while True:
+        if job.is_ready():
+            content = job.content
+            if content["dispatchState"] == "FAILED" or content.get("isFailed") in ("1", 1, True):
+                raise RuntimeError(f"Search job '{job.sid}' failed")
+            if content["isDone"] in ("1", 1, True):
+                return
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Search job '{job.sid}' did not complete within {timeout_seconds:g} seconds"
+                )
+            time.sleep(min(0.1, remaining))
+        else:
+            time.sleep(0.1)
+
+
+def _cleanup_search_job(
+    job: client.Job | None,
+    response: dict[str, Any],
+    error_fields: dict[str, Any] | None = None
+) -> None:
+    if job is None:
+        return
+    try:
+        job.cancel()
+    except Exception as cleanup_error:
+        message = f"Search job cleanup failed: {cleanup_error}"
+        if response.get("success") is False and response.get("error"):
+            message = f"{response['error']}; {message}"
+        response.clear()
+        response.update({"success": False, "error": message})
+        if error_fields is not None:
+            response.update(error_fields)
+
+
 @mcp.tool()
 def search_splunk(
     query: str,
     earliest_time: str = "-24h",
     latest_time: str = "now",
-    max_count: int = 0
+    max_count: int = 0,
+    timeout_seconds: float | None = None
 ) -> dict[str, Any]:
     """
     Execute a search query in Splunk and return results.
@@ -78,6 +134,7 @@ def search_splunk(
         earliest_time: Earliest time for search (e.g., '-24h', '-7d', '2024-01-01T00:00:00')
         latest_time: Latest time for search (e.g., 'now', '2024-01-31T23:59:59')
         max_count: Maximum number of results to return (default: 0, no limit)
+        timeout_seconds: Maximum completion-wait seconds; None waits without a limit.
 
     Returns:
         Dictionary containing search results and metadata
@@ -88,7 +145,11 @@ def search_splunk(
     if not query.strip().startswith(('search', '|', 'from', 'tstats', 'inputlookup')):
         query = f"search {query}"
 
+    job = None
+    response = {}
+
     try:
+        _validate_search_timeout(timeout_seconds)
         # Create search job (omit max_count for unlimited)
         job_kwargs = {
             "earliest_time": earliest_time,
@@ -100,8 +161,7 @@ def search_splunk(
         job = service.jobs.create(query, **job_kwargs)
 
         # Wait for job to complete
-        while not job.is_done():
-            pass
+        _wait_for_search_job(job, timeout_seconds)
 
         # Get results with pagination for unlimited (max_count=0)
         search_results = []
@@ -138,10 +198,7 @@ def search_splunk(
             "latest_time": latest_time
         }
 
-        # Clean up job
-        job.cancel()
-
-        return {
+        response = {
             "success": True,
             "results": search_results,
             "stats": stats,
@@ -149,11 +206,15 @@ def search_splunk(
         }
 
     except Exception as e:
-        return {
+        response = {
             "success": False,
             "error": str(e),
             "results": []
         }
+    finally:
+        _cleanup_search_job(job, response, {'results': []})
+
+    return response
 
 
 @mcp.tool()
@@ -184,6 +245,10 @@ def search_async(
     if not query.strip().startswith(('search', '|', 'from', 'tstats', 'inputlookup')):
         query = f"search {query}"
 
+    job = None
+    response = {}
+    handed_off = False
+
     try:
         # Create search job (non-blocking, omit max_count for unlimited)
         job_kwargs = {
@@ -195,7 +260,7 @@ def search_async(
 
         job = service.jobs.create(query, **job_kwargs)
 
-        return {
+        response = {
             "success": True,
             "message": "Search job created. Use get_job_results() to retrieve results.",
             "sid": job.sid,
@@ -204,11 +269,18 @@ def search_async(
             "latest_time": latest_time
         }
 
+        handed_off = True
+
     except Exception as e:
-        return {
+        response = {
             "success": False,
             "error": str(e)
         }
+    finally:
+        if not handed_off:
+            _cleanup_search_job(job, response, None)
+
+    return response
 
 
 @mcp.tool()
@@ -241,6 +313,9 @@ def search_realtime(
     if not query.strip().startswith(('search', '|', 'from', 'tstats', 'inputlookup')):
         query = f"search {query}"
 
+    job = None
+    response = {}
+
     try:
         # Create real-time search job
         job = service.jobs.create(
@@ -270,10 +345,7 @@ def search_realtime(
 
             time.sleep(1)
 
-        # Cancel the real-time job
-        job.cancel()
-
-        return {
+        response = {
             "success": True,
             "results": search_results[:max_count],
             "result_count": len(search_results[:max_count]),
@@ -282,11 +354,18 @@ def search_realtime(
         }
 
     except Exception as e:
-        return {
+        response = {
             "success": False,
             "error": str(e),
             "results": []
         }
+    finally:
+        _cleanup_search_job(job, response, {'results': []})
+
+    if response.get("success"):
+        response["collection_time_seconds"] = min(timeout_seconds, time.time() - start_time)
+
+    return response
 
 
 @mcp.tool()
@@ -296,7 +375,8 @@ def export_search_results(
     output_format: str = "csv",
     earliest_time: str = "-24h",
     latest_time: str = "now",
-    max_count: int = 50000
+    max_count: int = 50000,
+    timeout_seconds: float | None = None
 ) -> dict[str, Any]:
     """
     Execute a search and export results to a file.
@@ -308,6 +388,7 @@ def export_search_results(
         earliest_time: Earliest time for search (e.g., '-24h', '-7d')
         latest_time: Latest time for search (e.g., 'now')
         max_count: Maximum number of results to export (default: 50000, 0 = no limit)
+        timeout_seconds: Maximum completion-wait seconds; None waits without a limit.
 
     Returns:
         Dictionary indicating success and file details
@@ -325,7 +406,11 @@ def export_search_results(
             "error": f"Invalid output format '{output_format}'. Must be 'csv', 'json', or 'xml'."
         }
 
+    job = None
+    response = {}
+
     try:
+        _validate_search_timeout(timeout_seconds)
         # Create search job (omit max_count for unlimited)
         job_kwargs = {
             "earliest_time": earliest_time,
@@ -337,8 +422,7 @@ def export_search_results(
         job = service.jobs.create(query, **job_kwargs)
 
         # Wait for job to complete
-        while not job.is_done():
-            pass
+        _wait_for_search_job(job, timeout_seconds)
 
         # Get results with pagination for unlimited (max_count=0)
         if max_count == 0:
@@ -360,9 +444,9 @@ def export_search_results(
                     if len(batch) < batch_size:
                         break
 
-                # Write results as CSV
-                if search_results:
-                    with open(file_path, 'w', newline='', encoding='utf-8') as f:
+                # Always create/truncate the file, including an empty result set.
+                with open(file_path, 'w', newline='', encoding='utf-8') as f:
+                    if search_results:
                         writer = csv.DictWriter(f, fieldnames=search_results[0].keys())
                         writer.writeheader()
                         writer.writerows(search_results)
@@ -393,7 +477,7 @@ def export_search_results(
                         result_stream = job.results(count=batch_size, offset=offset, output_mode='xml')
                         content = result_stream.read().decode('utf-8')
                         # Extract <result> elements from each batch
-                        result_matches = re.findall(r'<result[^>]*>.*?</result>', content, re.DOTALL)
+                        result_matches = re.findall(r'<result(?=[\s>])[^>]*>.*?</result>', content, re.DOTALL)
                         if not result_matches:
                             break
                         for match in result_matches:
@@ -411,10 +495,12 @@ def export_search_results(
                 content = result_stream.read().decode('utf-8')
                 with open(file_path, 'w', newline='', encoding='utf-8') as f:
                     f.write(content)
-                row_count = content.count('\n') - 1 if content else 0
+                reader = csv.reader(io.StringIO(content, newline=''))
+                next(reader, None)  # Skip the header, including quoted newlines.
+                row_count = sum(1 for _ in reader)
 
             elif output_format == 'json':
-                reader = results.ResultsReader(result_stream)
+                reader = results.JSONResultsReader(result_stream)
                 search_results = []
                 for result in reader:
                     if isinstance(result, dict):
@@ -427,12 +513,9 @@ def export_search_results(
                 content = result_stream.read().decode('utf-8')
                 with open(file_path, 'w', encoding='utf-8') as f:
                     f.write(content)
-                row_count = content.count('<result>')
+                row_count = len(ElementTree.fromstring(content).findall('result'))
 
-        # Clean up job
-        job.cancel()
-
-        return {
+        response = {
             "success": True,
             "message": f"Results exported to {file_path}",
             "file_path": file_path,
@@ -441,10 +524,14 @@ def export_search_results(
         }
 
     except Exception as e:
-        return {
+        response = {
             "success": False,
             "error": str(e)
         }
+    finally:
+        _cleanup_search_job(job, response, None)
+
+    return response
 
 
 @mcp.tool()
@@ -529,7 +616,12 @@ def list_saved_searches(app: str | None = None) -> dict[str, Any]:
 
 
 @mcp.tool()
-def run_saved_search(name: str, app: str | None = None, max_count: int = 100) -> dict[str, Any]:
+def run_saved_search(
+    name: str,
+    app: str | None = None,
+    max_count: int = 100,
+    timeout_seconds: float | None = None
+) -> dict[str, Any]:
     """
     Execute a saved search by name and return its results.
 
@@ -537,13 +629,18 @@ def run_saved_search(name: str, app: str | None = None, max_count: int = 100) ->
         name: Name of the saved search to execute
         app: Optional app context to find the saved search in (default: first match)
         max_count: Maximum number of results to return (default: 100)
+        timeout_seconds: Maximum completion-wait seconds; None waits without a limit.
 
     Returns:
         Dictionary containing saved search results and metadata
     """
     service = get_splunk_service()
 
+    job = None
+    response = {}
+
     try:
+        _validate_search_timeout(timeout_seconds)
         if app:
             service.namespace['app'] = app
         # Get the saved search
@@ -561,8 +658,7 @@ def run_saved_search(name: str, app: str | None = None, max_count: int = 100) ->
         job = saved_search.dispatch()
 
         # Wait for job to complete
-        while not job.is_done():
-            pass
+        _wait_for_search_job(job, timeout_seconds)
 
         # Get results
         result_stream = job.results(count=max_count)
@@ -581,10 +677,7 @@ def run_saved_search(name: str, app: str | None = None, max_count: int = 100) ->
             "run_duration": job["runDuration"]
         }
 
-        # Clean up job
-        job.cancel()
-
-        return {
+        response = {
             "success": True,
             "saved_search_name": name,
             "results": search_results,
@@ -596,17 +689,21 @@ def run_saved_search(name: str, app: str | None = None, max_count: int = 100) ->
         error_msg = f"Saved search '{name}' not found"
         if app:
             error_msg += f" in app '{app}'"
-        return {
+        response = {
             "success": False,
             "error": error_msg,
             "results": []
         }
     except Exception as e:
-        return {
+        response = {
             "success": False,
             "error": str(e),
             "results": []
         }
+    finally:
+        _cleanup_search_job(job, response, {'results': []})
+
+    return response
 
 
 @mcp.tool()
@@ -1008,7 +1105,7 @@ def update_index(
         frozen_time_period_in_secs: Time in seconds before data is frozen
         max_hot_buckets: Maximum number of hot buckets
         max_warm_db_count: Maximum number of warm buckets
-        disabled: Enable/disable the index
+        disabled: Enable/disable the index using its dedicated control endpoint
         min_raw_file_sync_secs: Minimum raw file sync interval ('disable' or seconds)
         max_hot_span_secs: Maximum time span for hot buckets in seconds
 
@@ -1043,7 +1140,15 @@ def update_index(
                 "error": "No update parameters provided"
             }
 
-        index.update(**update_dict).refresh()
+        settings_update = {key: value for key, value in update_dict.items() if key != "disabled"}
+        if settings_update:
+            index.update(**settings_update).refresh()
+        if disabled is not None and disabled != bool(int(index.disabled)):
+            if disabled:
+                index.disable()
+            else:
+                index.enable()
+            index.refresh()
 
         return {
             "success": True,
@@ -1652,7 +1757,12 @@ def delete_alert(name: str, app: str | None = None) -> dict[str, Any]:
 
 
 @mcp.tool()
-def get_alert_history(name: str, app: str | None = None, max_count: int = 50) -> dict[str, Any]:
+def get_alert_history(
+    name: str,
+    app: str | None = None,
+    max_count: int = 50,
+    timeout_seconds: float | None = None
+) -> dict[str, Any]:
     """
     Get the firing history of an alert.
 
@@ -1664,13 +1774,18 @@ def get_alert_history(name: str, app: str | None = None, max_count: int = 50) ->
         name: Name of the alert
         app: Optional app context to filter alert history (default: all apps)
         max_count: Maximum number of history entries to return
+        timeout_seconds: Maximum completion-wait seconds; None waits without a limit.
 
     Returns:
         Dictionary containing alert history
     """
     service = get_splunk_service()
 
+    job = None
+    response = {}
+
     try:
+        _validate_search_timeout(timeout_seconds)
         # Search for alert actions in the _audit index
         query = f'search index=_audit action="alert_fired" savedsearch_name="{name}"'
         if app:
@@ -1682,8 +1797,7 @@ def get_alert_history(name: str, app: str | None = None, max_count: int = 50) ->
             max_count=max_count
         )
 
-        while not job.is_done():
-            pass
+        _wait_for_search_job(job, timeout_seconds)
 
         result_stream = job.results(count=max_count)
         reader = results.ResultsReader(result_stream)
@@ -1693,9 +1807,7 @@ def get_alert_history(name: str, app: str | None = None, max_count: int = 50) ->
             if isinstance(result, dict):
                 history.append(result)
 
-        job.cancel()
-
-        return {
+        response = {
             "success": True,
             "alert_name": name,
             "history": history,
@@ -1703,11 +1815,15 @@ def get_alert_history(name: str, app: str | None = None, max_count: int = 50) ->
         }
 
     except Exception as e:
-        return {
+        response = {
             "success": False,
             "error": str(e),
             "history": []
         }
+    finally:
+        _cleanup_search_job(job, response, {'history': []})
+
+    return response
 
 
 # ============================================================================
@@ -1931,7 +2047,12 @@ def list_lookups(app: str = "-") -> dict[str, Any]:
 
 
 @mcp.tool()
-def get_lookup_data(lookup_name: str, app: str | None = None, max_rows: int = 1000) -> dict[str, Any]:
+def get_lookup_data(
+    lookup_name: str,
+    app: str | None = None,
+    max_rows: int = 1000,
+    timeout_seconds: float | None = None
+) -> dict[str, Any]:
     """
     Retrieve data from a lookup table.
 
@@ -1939,13 +2060,18 @@ def get_lookup_data(lookup_name: str, app: str | None = None, max_rows: int = 10
         lookup_name: Name of the lookup table file
         app: Optional app context to find the lookup in (default: search order)
         max_rows: Maximum number of rows to return (default: 1000)
+        timeout_seconds: Maximum completion-wait seconds; None waits without a limit.
 
     Returns:
         Dictionary containing lookup data
     """
     service = get_splunk_service()
 
+    job = None
+    response = {}
+
     try:
+        _validate_search_timeout(timeout_seconds)
         if app:
             service.namespace['app'] = app
 
@@ -1953,8 +2079,7 @@ def get_lookup_data(lookup_name: str, app: str | None = None, max_rows: int = 10
         query = f"| inputlookup {lookup_name}"
         job = service.jobs.create(query, max_count=max_rows)
 
-        while not job.is_done():
-            pass
+        _wait_for_search_job(job, timeout_seconds)
 
         result_stream = job.results(count=max_rows)
         reader = results.ResultsReader(result_stream)
@@ -1964,9 +2089,7 @@ def get_lookup_data(lookup_name: str, app: str | None = None, max_rows: int = 10
             if isinstance(result, dict):
                 lookup_data.append(result)
 
-        job.cancel()
-
-        return {
+        response = {
             "success": True,
             "lookup_name": lookup_name,
             "data": lookup_data,
@@ -1974,71 +2097,15 @@ def get_lookup_data(lookup_name: str, app: str | None = None, max_rows: int = 10
         }
 
     except Exception as e:
-        return {
+        response = {
             "success": False,
             "error": str(e),
             "data": []
         }
+    finally:
+        _cleanup_search_job(job, response, {'data': []})
 
-
-@mcp.tool()
-def update_lookup_data(
-    lookup_name: str,
-    data: list[dict[str, Any]],
-    app: str = "search"
-) -> dict[str, Any]:
-    """
-    Update a lookup table with new data. This replaces all existing data.
-
-    Args:
-        lookup_name: Name of the lookup table file
-        data: List of dictionaries containing the lookup data
-        app: App containing the lookup (default: search)
-
-    Returns:
-        Dictionary indicating success or failure
-
-    Note:
-        The data is converted to CSV format automatically. All dictionaries in the list
-        must have the same keys. The first dictionary's keys determine the CSV headers.
-    """
-    service = get_splunk_service()
-
-    try:
-        # Convert data to CSV format
-        if not data:
-            return {
-                "success": False,
-                "error": "No data provided"
-            }
-
-        # Get headers from first row
-        headers = list(data[0].keys())
-        csv_lines = [",".join(headers)]
-
-        # Add data rows
-        for row in data:
-            csv_lines.append(",".join(str(row.get(h, "")) for h in headers))
-
-        csv_content = "\n".join(csv_lines)
-
-        # Upload the lookup file
-        service.post(
-            f'data/lookup-table-files/{lookup_name}',
-            **{"eai:data": csv_content, "eai:appName": app}
-        )
-
-        return {
-            "success": True,
-            "message": f"Lookup '{lookup_name}' updated successfully",
-            "rows_written": len(data)
-        }
-
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
+    return response
 
 
 @mcp.tool()
@@ -3446,8 +3513,14 @@ def get_kvstore_collection(
         # Try to get the schema/fields from the collection
         if hasattr(collection, 'content'):
             content = collection.content
-            info["fields"] = content.get("field", {})
-            info["accelerated_fields"] = content.get("accelerated_fields", {})
+            info["fields"] = {
+                key[len("field."):]: value
+                for key, value in content.items() if key.startswith("field.")
+            }
+            info["accelerated_fields"] = {
+                key[len("accelerated_fields."):]: value
+                for key, value in content.items() if key.startswith("accelerated_fields.")
+            }
 
         return {
             "success": True,
@@ -3627,6 +3700,7 @@ def create_kvstore_lookup(
     if collection_name is None:
         collection_name = lookup_name
 
+    collection_created = False
     try:
         service.namespace['app'] = app
         service.namespace['owner'] = 'nobody'
@@ -3638,6 +3712,7 @@ def create_kvstore_lookup(
                 kwargs[f"field.{field_name}"] = field_type
 
         service.kvstore.create(collection_name, **kwargs)
+        collection_created = True
 
         # Step 2: Create the lookup definition in transforms.conf
         transforms_conf = service.confs['transforms']
@@ -3669,11 +3744,12 @@ def create_kvstore_lookup(
         }
 
     except Exception as e:
-        # Attempt cleanup if collection was created but transforms failed
-        try:
-            service.kvstore[collection_name].delete()
-        except:
-            pass
+        # Only roll back a collection created by this invocation.
+        if collection_created:
+            try:
+                service.kvstore[collection_name].delete()
+            except:
+                pass
         return {
             "success": False,
             "error": str(e)
@@ -3912,22 +3988,18 @@ def list_data_models(app: str = "-") -> dict[str, Any]:
         # Extract only essential fields for list operations
         data_models = []
         for entry in data.get('entry', []):
-            content = entry.get('content', {})
+            content = entry['content']
 
-            # Parse JSON-encoded strings in content
-            acceleration_str = content.get('acceleration', '{}')
-            description_str = content.get('description', '{}')
-
-            try:
-                acceleration = json.loads(acceleration_str) if isinstance(acceleration_str, str) else acceleration_str
-            except json.JSONDecodeError:
-                acceleration = {}
-
-            try:
-                description_data = json.loads(description_str) if isinstance(description_str, str) else description_str
-                description = description_data.get('description', '') if isinstance(description_data, dict) else str(description_data)
-            except json.JSONDecodeError:
-                description = description_str
+            # Required model metadata must decode correctly, not imply disabled acceleration.
+            acceleration_str = content['acceleration']
+            description_str = content['description']
+            acceleration = json.loads(acceleration_str) if isinstance(acceleration_str, str) else acceleration_str
+            if not isinstance(acceleration, dict):
+                raise ValueError(f"Data model '{entry['name']}' acceleration must be a JSON object")
+            description_data = json.loads(description_str) if isinstance(description_str, str) else description_str
+            if not isinstance(description_data, dict):
+                raise ValueError(f"Data model '{entry['name']}' definition must be a JSON object")
+            description = description_data.get('description', '')
 
             data_models.append({
                 "name": entry.get('name'),
@@ -3983,23 +4055,24 @@ def get_data_model(name: str, app: str = "search", summary_only: bool = True) ->
 
         if summary_only:
             # Return summary with key metadata
-            content = entry.get('content', {})
-            objects = content.get('objects', [])
+            content = entry['content']
 
-            # Parse JSON-encoded strings in content
-            acceleration_str = content.get('acceleration', '{}')
-            description_str = content.get('description', '{}')
+            # The model definition, including its objects, is encoded in description.
+            acceleration_str = content['acceleration']
+            description_str = content['description']
+            acceleration = json.loads(acceleration_str) if isinstance(acceleration_str, str) else acceleration_str
+            if not isinstance(acceleration, dict):
+                raise ValueError("Data model acceleration must be a JSON object")
 
-            try:
-                acceleration = json.loads(acceleration_str) if isinstance(acceleration_str, str) else acceleration_str
-            except json.JSONDecodeError:
-                acceleration = {}
-
-            try:
-                description_data = json.loads(description_str) if isinstance(description_str, str) else description_str
-                description = description_data.get('description', '') if isinstance(description_data, dict) else str(description_data)
-            except json.JSONDecodeError:
-                description = description_str
+            description_data = json.loads(description_str) if isinstance(description_str, str) else description_str
+            if not isinstance(description_data, dict):
+                raise ValueError("Data model definition must be a JSON object")
+            objects = description_data.get('objects')
+            if not isinstance(objects, list):
+                raise ValueError("Data model definition must contain an 'objects' list")
+            if any(not isinstance(obj, dict) or not isinstance(obj.get('objectName'), str) for obj in objects):
+                raise ValueError("Data model objects must contain string 'objectName' values")
+            description = description_data.get('description', '')
 
             return {
                 "success": True,
@@ -4033,7 +4106,8 @@ def search_data_model(
     search_filter: Optional[str] = None,
     earliest_time: str = "-24h",
     latest_time: str = "now",
-    max_count: int = 100
+    max_count: int = 100,
+    timeout_seconds: float | None = None
 ) -> dict[str, Any]:
     """
     Execute a tstats search on a data model for accelerated queries.
@@ -4048,13 +4122,18 @@ def search_data_model(
         earliest_time: Earliest time for search (default: -24h)
         latest_time: Latest time for search (default: now)
         max_count: Maximum number of results to return (default: 100)
+        timeout_seconds: Maximum completion-wait seconds; None waits without a limit.
 
     Returns:
         Dictionary containing search results
     """
     service = get_splunk_service()
 
+    job = None
+    response = {}
+
     try:
+        _validate_search_timeout(timeout_seconds)
         # Build tstats query
         query = f"| tstats count from datamodel={datamodel}.{object_name}"
         if search_filter:
@@ -4067,8 +4146,7 @@ def search_data_model(
             max_count=max_count
         )
 
-        while not job.is_done():
-            pass
+        _wait_for_search_job(job, timeout_seconds)
 
         result_stream = job.results(count=max_count)
         reader = results.ResultsReader(result_stream)
@@ -4078,9 +4156,7 @@ def search_data_model(
             if isinstance(result, dict):
                 search_results.append(result)
 
-        job.cancel()
-
-        return {
+        response = {
             "success": True,
             "datamodel": datamodel,
             "object": object_name,
@@ -4089,11 +4165,15 @@ def search_data_model(
         }
 
     except Exception as e:
-        return {
+        response = {
             "success": False,
             "error": str(e),
             "results": []
         }
+    finally:
+        _cleanup_search_job(job, response, {'results': []})
+
+    return response
 
 
 # ============================================================================
@@ -4101,12 +4181,18 @@ def search_data_model(
 # ============================================================================
 
 @mcp.tool()
-def list_jobs(count: int = 100) -> dict[str, Any]:
+def list_jobs(
+    count: int = 100,
+    app: str | None = None,
+    owner: str | None = None
+) -> dict[str, Any]:
     """
     List recent search jobs.
 
     Args:
-        count: Maximum number of jobs to return (default: 100)
+        count: Maximum number of jobs to return (default: 100, 0 = all)
+        app: Optional app context to filter jobs (default: all apps)
+        owner: Optional owner to filter jobs (default: all owners)
 
     Returns:
         Dictionary containing list of jobs
@@ -4115,7 +4201,16 @@ def list_jobs(count: int = 100) -> dict[str, Any]:
 
     try:
         jobs = []
-        for job in service.jobs.list(count=count):
+        # Apply filters before the requested result limit.
+        fetch_count = 0 if (app or owner) and count > 0 else count
+        for job in service.jobs.list(count=fetch_count):
+            job_app = job.access.app if hasattr(job, 'access') else None
+            job_owner = job.access.owner if hasattr(job, 'access') else None
+            if app and job_app != app:
+                continue
+            if owner and job_owner != owner:
+                continue
+
             jobs.append({
                 "sid": job.sid,
                 "search": job.content.get("search", ""),
@@ -4124,8 +4219,17 @@ def list_jobs(count: int = 100) -> dict[str, Any]:
                 "latest_time": job.content.get("latestTime", ""),
                 "result_count": job.content.get("resultCount", 0),
                 "is_done": job.is_done(),
-                "ttl": job.content.get("ttl", "")
+                "ttl": job.content.get("ttl", ""),
+                "app": job_app,
+                "owner": job_owner,
+                "is_zombie": job.content.get("isZombie", False),
+                "run_duration": job.content.get("runDuration", ""),
+                "event_count": job.content.get("eventCount", 0),
+                "scan_count": job.content.get("scanCount", 0),
+                "create_time": job.content.get("createTime", "")
             })
+            if count > 0 and len(jobs) >= count:
+                break
 
         return {
             "success": True,
@@ -4142,25 +4246,33 @@ def list_jobs(count: int = 100) -> dict[str, Any]:
 
 
 @mcp.tool()
-def get_job_results(sid: str, max_count: int = 100) -> dict[str, Any]:
+def get_job_results(
+    sid: str,
+    max_count: int = 100,
+    timeout_seconds: float | None = None
+) -> dict[str, Any]:
     """
     Get results from a specific search job.
 
     Args:
         sid: Search ID (SID) of the job
         max_count: Maximum number of results to return (default: 100, 0 = no limit)
+        timeout_seconds: Maximum completion-wait seconds; None waits without a limit.
 
     Returns:
         Dictionary containing job results
+
+    Note:
+        Timeout or failure does not cancel this caller-owned job.
     """
     service = get_splunk_service()
 
     try:
+        _validate_search_timeout(timeout_seconds)
         job = service.job(sid)
 
         # Wait for job to complete if still running
-        while not job.is_done():
-            pass
+        _wait_for_search_job(job, timeout_seconds)
 
         # Get results with pagination for unlimited (max_count=0)
         search_results = []
@@ -4214,7 +4326,7 @@ def cancel_job(sid: str) -> dict[str, Any]:
     service = get_splunk_service()
 
     try:
-        job = service.job(sid)
+        job = service.jobs[sid]
         job.cancel()
 
         return {
@@ -4223,6 +4335,11 @@ def cancel_job(sid: str) -> dict[str, Any]:
             "sid": sid
         }
 
+    except KeyError:
+        return {
+            "success": False,
+            "error": f"Job '{sid}' not found"
+        }
     except Exception as e:
         return {
             "success": False,
@@ -4234,13 +4351,31 @@ def cancel_job(sid: str) -> dict[str, Any]:
 # Search Macro Tools
 # ============================================================================
 
+def _find_macro(service: client.Service, name: str, app: str | None):
+    """Resolve exactly one macro in the requested app across visible owners."""
+    target_app = "-" if app is None else app
+    service.namespace['app'] = target_app
+    service.namespace['owner'] = "-"
+
+    matches = [
+        macro for macro in service.macros
+        if macro.name == name and (target_app == "-" or macro.access.app == target_app)
+    ]
+    if not matches:
+        raise KeyError(name)
+    if len(matches) > 1:
+        scope = "all apps" if target_app == "-" else f"app '{target_app}'"
+        raise ValueError(f"Macro '{name}' is ambiguous in {scope}: multiple matches")
+    return matches[0]
+
+
 @mcp.tool()
-def list_macros(app: str = "-") -> dict[str, Any]:
+def list_macros(app: str | None = "-") -> dict[str, Any]:
     """
     List all search macros in Splunk.
 
     Args:
-        app: Specific app to list macros from (default: all apps)
+        app: Specific app to list macros from (default: all apps; None also lists all)
 
     Returns:
         Dictionary containing list of macros with their properties
@@ -4248,13 +4383,15 @@ def list_macros(app: str = "-") -> dict[str, Any]:
     service = get_splunk_service()
 
     try:
+        service.namespace['app'] = app or "-"
+        service.namespace['owner'] = "-"
+
         macros = []
         for macro in service.macros:
-            # Filter by app if specified
-            if app != "-":
-                macro_app = macro.access.app if hasattr(macro, 'access') else None
-                if macro_app != app:
-                    continue
+            # Filter inherited macros out of a specific app's results.
+            macro_app = macro.access.app if hasattr(macro, 'access') else None
+            if app and app != "-" and macro_app != app:
+                continue
 
             macros.append({
                 "name": macro.name,
@@ -4263,7 +4400,8 @@ def list_macros(app: str = "-") -> dict[str, Any]:
                 "iseval": macro.content.get("iseval", False),
                 "disabled": macro.content.get("disabled", False),
                 "app": macro.access.app if hasattr(macro, 'access') else app,
-                "sharing": macro.access.sharing if hasattr(macro, 'access') else 'N/A'
+                "sharing": macro.access.sharing if hasattr(macro, 'access') else 'N/A',
+                "owner": macro.access.owner if hasattr(macro, 'access') else ''
             })
 
         return {
@@ -4281,29 +4419,26 @@ def list_macros(app: str = "-") -> dict[str, Any]:
 
 
 @mcp.tool()
-def get_macro(name: str, app: str = "search") -> dict[str, Any]:
+def get_macro(name: str, app: str | None = "search") -> dict[str, Any]:
     """
     Get detailed information about a specific search macro.
 
     Args:
         name: Name of the macro
-        app: App containing the macro (default: search)
+        app: App containing the macro (default: search).
+            None or "-" searches all apps. The match must be unique.
 
     Returns:
-        Dictionary containing macro details
+        Dictionary containing macro details under both macro_info and macro
 
     Note:
-        If the macro exists in multiple apps, this retrieves the macro
-        from the specified app context. Use list_macros() to see all macros
-        across apps.
+        Multiple matching owners or apps return an ambiguity error instead
+        of choosing a macro. Use list_macros() to inspect app/owner metadata.
     """
     service = get_splunk_service()
 
     try:
-        # Set namespace to specific app
-        service.namespace['app'] = app
-
-        macro = service.macros[name]
+        macro = _find_macro(service, name, app)
 
         info = {
             "name": macro.name,
@@ -4315,18 +4450,23 @@ def get_macro(name: str, app: str = "search") -> dict[str, Any]:
             "disabled": macro.content.get("disabled", False),
             "app": macro.access.app if hasattr(macro, 'access') else app,
             "author": macro.access.owner if hasattr(macro, 'access') else 'N/A',
-            "sharing": macro.access.sharing if hasattr(macro, 'access') else 'N/A'
+            "sharing": macro.access.sharing if hasattr(macro, 'access') else 'N/A',
+            "owner": macro.access.owner if hasattr(macro, 'access') else ''
         }
 
         return {
             "success": True,
-            "macro_info": info
+            "macro_info": info,
+            "macro": info
         }
 
     except KeyError:
+        error = f"Macro '{name}' not found"
+        if app and app != "-":
+            error += f" in app '{app}'"
         return {
             "success": False,
-            "error": f"Macro '{name}' not found in app '{app}'"
+            "error": error
         }
     except Exception as e:
         return {
@@ -4342,18 +4482,22 @@ def create_macro(
     args: Optional[str] = None,
     iseval: bool = False,
     app: str = "search",
-    description: Optional[str] = None
+    description: Optional[str] = None,
+    validation: Optional[str] = None,
+    errormsg: Optional[str] = None
 ) -> dict[str, Any]:
     """
     Create a new search macro in Splunk.
 
     Args:
-        name: Name of the macro
+        name: Name of the macro (include its argument count, e.g., "mymacro(1)")
         definition: The macro definition (SPL code)
         args: Comma-separated list of argument names (e.g., "arg1,arg2")
         iseval: Whether the macro is eval-based (default: False)
         app: App to create the macro in (default: search)
         description: Optional description of the macro
+        validation: Optional validation expression
+        errormsg: Optional error message when validation fails
 
     Returns:
         Dictionary indicating success or failure
@@ -4370,6 +4514,10 @@ def create_macro(
             kwargs["args"] = args
         if description:
             kwargs["description"] = description
+        if validation is not None:
+            kwargs["validation"] = validation
+        if errormsg is not None:
+            kwargs["errormsg"] = errormsg
 
         # Create the macro
         service.macros.create(name, definition, **kwargs)
@@ -4377,7 +4525,8 @@ def create_macro(
         return {
             "success": True,
             "message": f"Macro '{name}' created successfully in app '{app}'",
-            "macro_name": name
+            "macro_name": name,
+            "app": app
         }
 
     except Exception as e:
@@ -4394,7 +4543,9 @@ def update_macro(
     args: Optional[str] = None,
     iseval: Optional[bool] = None,
     disabled: Optional[bool] = None,
-    app: str = "search"
+    app: str | None = "search",
+    validation: Optional[str] = None,
+    errormsg: Optional[str] = None
 ) -> dict[str, Any]:
     """
     Update an existing search macro.
@@ -4405,7 +4556,10 @@ def update_macro(
         args: Optional new argument list
         iseval: Optional new iseval setting
         disabled: Optional enable/disable the macro
-        app: App containing the macro (default: search)
+        app: App containing the macro (default: search).
+            None or "-" searches all apps. The match must be unique.
+        validation: Optional new validation expression; an empty string clears it
+        errormsg: Optional new error message; an empty string clears it
 
     Returns:
         Dictionary indicating success or failure
@@ -4413,10 +4567,7 @@ def update_macro(
     service = get_splunk_service()
 
     try:
-        # Set namespace to specific app
-        service.namespace['app'] = app
-
-        macro = service.macros[name]
+        macro = _find_macro(service, name, app)
 
         # Update only provided fields
         update_dict = {}
@@ -4428,6 +4579,10 @@ def update_macro(
             update_dict["iseval"] = iseval
         if disabled is not None:
             update_dict["disabled"] = disabled
+        if validation is not None:
+            update_dict["validation"] = validation
+        if errormsg is not None:
+            update_dict["errormsg"] = errormsg
 
         macro.update(**update_dict).refresh()
 
@@ -4437,9 +4592,12 @@ def update_macro(
         }
 
     except KeyError:
+        error = f"Macro '{name}' not found"
+        if app and app != "-":
+            error += f" in app '{app}'"
         return {
             "success": False,
-            "error": f"Macro '{name}' not found in app '{app}'"
+            "error": error
         }
     except Exception as e:
         return {
@@ -4449,13 +4607,14 @@ def update_macro(
 
 
 @mcp.tool()
-def delete_macro(name: str, app: str = "search") -> dict[str, Any]:
+def delete_macro(name: str, app: str | None = "search") -> dict[str, Any]:
     """
     Delete a search macro from Splunk.
 
     Args:
         name: Name of the macro to delete
-        app: App containing the macro (default: search)
+        app: App containing the macro (default: search).
+            None or "-" searches all apps. The match must be unique.
 
     Returns:
         Dictionary indicating success or failure
@@ -4463,10 +4622,7 @@ def delete_macro(name: str, app: str = "search") -> dict[str, Any]:
     service = get_splunk_service()
 
     try:
-        # Set namespace to specific app
-        service.namespace['app'] = app
-
-        macro = service.macros[name]
+        macro = _find_macro(service, name, app)
         macro.delete()
 
         return {
@@ -4475,9 +4631,12 @@ def delete_macro(name: str, app: str = "search") -> dict[str, Any]:
         }
 
     except KeyError:
+        error = f"Macro '{name}' not found"
+        if app and app != "-":
+            error += f" in app '{app}'"
         return {
             "success": False,
-            "error": f"Macro '{name}' not found in app '{app}'"
+            "error": error
         }
     except Exception as e:
         return {
@@ -4788,12 +4947,13 @@ def get_server_settings() -> dict[str, Any]:
 
 
 @mcp.tool()
-def update_server_settings(**kwargs) -> dict[str, Any]:
+def update_server_settings(kwargs: dict[str, Any]) -> dict[str, Any]:
     """
     Update Splunk server configuration settings.
 
     Args:
-        **kwargs: Settings to update. Common settings include:
+        kwargs: JSON object of settings to update, not a JSON-encoded string.
+            Common settings include:
             - sessionTimeout: Session timeout in seconds
             - startwebserver: Boolean to enable/disable Splunk Web
             - httpport: Splunk Web port number
@@ -4907,354 +5067,8 @@ def refresh_splunk() -> dict[str, Any]:
 
 
 # ============================================================================
-# Macro Management Tools
-# ============================================================================
-
-@mcp.tool()
-def list_macros(app: str | None = None) -> dict[str, Any]:
-    """
-    List all search macros in Splunk.
-
-    Args:
-        app: Optional app context to filter macros (default: all apps)
-
-    Returns:
-        Dictionary containing list of macros with their properties
-    """
-    service = get_splunk_service()
-
-    try:
-        # Use REST API to get macros
-        params = {"count": -1, "output_mode": "json"}
-        if app:
-            endpoint = f"/servicesNS/-/{app}/data/macros"
-        else:
-            endpoint = "/servicesNS/-/-/data/macros"
-
-        response = service.get(endpoint, **params)
-        data = json.loads(response.body.read().decode('utf-8'))
-
-        macros = []
-        for entry in data.get('entry', []):
-            macro_app = entry.get('acl', {}).get('app', '')
-            if app and macro_app != app:
-                continue
-            macros.append({
-                "name": entry.get('name'),
-                "app": macro_app,
-                "definition": entry.get('content', {}).get('definition', ''),
-                "args": entry.get('content', {}).get('args', ''),
-                "owner": entry.get('acl', {}).get('owner', ''),
-                "sharing": entry.get('acl', {}).get('sharing', '')
-            })
-
-        return {
-            "success": True,
-            "macros": macros,
-            "count": len(macros)
-        }
-
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "macros": []
-        }
-
-
-@mcp.tool()
-def get_macro(name: str, app: str | None = None) -> dict[str, Any]:
-    """
-    Get detailed information about a specific macro.
-
-    Args:
-        name: Name of the macro to retrieve
-        app: Optional app context to find the macro in (default: first match)
-
-    Returns:
-        Dictionary containing macro details
-    """
-    service = get_splunk_service()
-
-    try:
-        if app:
-            endpoint = f"/servicesNS/-/{app}/data/macros/{name}"
-        else:
-            endpoint = f"/servicesNS/-/-/data/macros/{name}"
-
-        response = service.get(endpoint, output_mode="json")
-        data = json.loads(response.body.read().decode('utf-8'))
-
-        if not data.get('entry'):
-            return {
-                "success": False,
-                "error": f"Macro '{name}' not found"
-            }
-
-        entry = data['entry'][0]
-        macro_app = entry.get('acl', {}).get('app', '')
-
-        # Validate app matches if specified
-        if app and macro_app != app:
-            return {
-                "success": False,
-                "error": f"Macro '{name}' not found in app '{app}'"
-            }
-
-        return {
-            "success": True,
-            "macro": {
-                "name": entry.get('name'),
-                "app": macro_app,
-                "definition": entry.get('content', {}).get('definition', ''),
-                "args": entry.get('content', {}).get('args', ''),
-                "validation": entry.get('content', {}).get('validation', ''),
-                "errormsg": entry.get('content', {}).get('errormsg', ''),
-                "owner": entry.get('acl', {}).get('owner', ''),
-                "sharing": entry.get('acl', {}).get('sharing', '')
-            }
-        }
-
-    except Exception as e:
-        error_msg = str(e)
-        if "HTTP 404" in error_msg:
-            error_msg = f"Macro '{name}' not found"
-            if app:
-                error_msg += f" in app '{app}'"
-        return {
-            "success": False,
-            "error": error_msg
-        }
-
-
-@mcp.tool()
-def create_macro(
-    name: str,
-    definition: str,
-    app: str = "search",
-    args: str | None = None,
-    validation: str | None = None,
-    errormsg: str | None = None
-) -> dict[str, Any]:
-    """
-    Create a new search macro in Splunk.
-
-    Args:
-        name: Name of the macro (use $arg$ for arguments, e.g., 'mymacro(1)')
-        definition: The SPL definition of the macro
-        app: App to create the macro in (default: search)
-        args: Comma-separated list of argument names (e.g., 'arg1,arg2')
-        validation: Optional validation expression
-        errormsg: Optional error message when validation fails
-
-    Returns:
-        Dictionary indicating success or failure
-    """
-    service = get_splunk_service()
-
-    try:
-        endpoint = f"/servicesNS/nobody/{app}/data/macros"
-
-        params = {
-            "name": name,
-            "definition": definition,
-            "output_mode": "json"
-        }
-
-        if args:
-            params["args"] = args
-        if validation:
-            params["validation"] = validation
-        if errormsg:
-            params["errormsg"] = errormsg
-
-        service.post(endpoint, **params)
-
-        return {
-            "success": True,
-            "message": f"Macro '{name}' created successfully in app '{app}'",
-            "macro_name": name,
-            "app": app
-        }
-
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-
-@mcp.tool()
-def update_macro(
-    name: str,
-    app: str | None = None,
-    definition: str | None = None,
-    args: str | None = None,
-    validation: str | None = None,
-    errormsg: str | None = None
-) -> dict[str, Any]:
-    """
-    Update an existing search macro in Splunk.
-
-    Args:
-        name: Name of the macro to update
-        app: Optional app context to find the macro in (default: first match)
-        definition: New SPL definition
-        args: New comma-separated list of argument names
-        validation: New validation expression
-        errormsg: New error message for validation
-
-    Returns:
-        Dictionary indicating success or failure
-    """
-    service = get_splunk_service()
-
-    try:
-        # First, find the macro to get its app if not specified
-        if not app:
-            result = get_macro(name)
-            if not result['success']:
-                return result
-            app = result['macro']['app']
-
-        endpoint = f"/servicesNS/nobody/{app}/data/macros/{name}"
-
-        params = {"output_mode": "json"}
-        if definition is not None:
-            params["definition"] = definition
-        if args is not None:
-            params["args"] = args
-        if validation is not None:
-            params["validation"] = validation
-        if errormsg is not None:
-            params["errormsg"] = errormsg
-
-        if len(params) == 1:  # Only output_mode
-            return {
-                "success": False,
-                "error": "No update parameters provided"
-            }
-
-        service.post(endpoint, **params)
-
-        return {
-            "success": True,
-            "message": f"Macro '{name}' updated successfully"
-        }
-
-    except Exception as e:
-        error_msg = str(e)
-        if "HTTP 404" in error_msg:
-            error_msg = f"Macro '{name}' not found"
-            if app:
-                error_msg += f" in app '{app}'"
-        return {
-            "success": False,
-            "error": error_msg
-        }
-
-
-@mcp.tool()
-def delete_macro(name: str, app: str | None = None) -> dict[str, Any]:
-    """
-    Delete a search macro from Splunk.
-
-    Args:
-        name: Name of the macro to delete
-        app: Optional app context to find the macro in (default: first match)
-
-    Returns:
-        Dictionary indicating success or failure
-    """
-    service = get_splunk_service()
-
-    try:
-        # First, find the macro to get its app if not specified
-        if not app:
-            result = get_macro(name)
-            if not result['success']:
-                return result
-            app = result['macro']['app']
-
-        endpoint = f"/servicesNS/nobody/{app}/data/macros/{name}"
-        service.delete(endpoint)
-
-        return {
-            "success": True,
-            "message": f"Macro '{name}' deleted successfully"
-        }
-
-    except Exception as e:
-        error_msg = str(e)
-        if "HTTP 404" in error_msg:
-            error_msg = f"Macro '{name}' not found"
-            if app:
-                error_msg += f" in app '{app}'"
-        return {
-            "success": False,
-            "error": error_msg
-        }
-
-
-# ============================================================================
 # Job Management Tools
 # ============================================================================
-
-@mcp.tool()
-def list_jobs(app: str | None = None, owner: str | None = None) -> dict[str, Any]:
-    """
-    List all search jobs in Splunk.
-
-    Args:
-        app: Optional app context to filter jobs (default: all apps)
-        owner: Optional owner to filter jobs (default: all owners)
-
-    Returns:
-        Dictionary containing list of jobs with their properties
-    """
-    service = get_splunk_service()
-
-    try:
-        jobs = []
-        for job in service.jobs:
-            job_app = job.access.app if hasattr(job, 'access') else None
-            job_owner = job.access.owner if hasattr(job, 'access') else None
-
-            if app and job_app != app:
-                continue
-            if owner and job_owner != owner:
-                continue
-
-            jobs.append({
-                "sid": job.sid,
-                "app": job_app,
-                "owner": job_owner,
-                "search": job.content.get("search", "")[:200],  # Truncate long searches
-                "status": job.content.get("dispatchState", ""),
-                "is_done": job.is_done(),
-                "is_zombie": job.content.get("isZombie", False),
-                "run_duration": job.content.get("runDuration", ""),
-                "result_count": job.content.get("resultCount", 0),
-                "event_count": job.content.get("eventCount", 0),
-                "scan_count": job.content.get("scanCount", 0),
-                "earliest_time": job.content.get("earliestTime", ""),
-                "latest_time": job.content.get("latestTime", ""),
-                "create_time": job.content.get("createTime", "")
-            })
-
-        return {
-            "success": True,
-            "jobs": jobs,
-            "count": len(jobs)
-        }
-
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "jobs": []
-        }
-
 
 @mcp.tool()
 def get_job_status(sid: str) -> dict[str, Any]:
@@ -5311,40 +5125,6 @@ def get_job_status(sid: str) -> dict[str, Any]:
         }
 
 
-@mcp.tool()
-def cancel_job(sid: str) -> dict[str, Any]:
-    """
-    Cancel a running search job.
-
-    Args:
-        sid: Search ID (job ID) to cancel
-
-    Returns:
-        Dictionary indicating success or failure
-    """
-    service = get_splunk_service()
-
-    try:
-        job = service.jobs[sid]
-        job.cancel()
-
-        return {
-            "success": True,
-            "message": f"Job '{sid}' cancelled successfully"
-        }
-
-    except KeyError:
-        return {
-            "success": False,
-            "error": f"Job '{sid}' not found"
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-
 # ============================================================================
 # Field Summary Tools
 # ============================================================================
@@ -5354,7 +5134,8 @@ def get_field_summary(
     index: str,
     earliest_time: str = "-24h",
     latest_time: str = "now",
-    max_values: int = 10
+    max_values: int = 10,
+    timeout_seconds: float | None = None
 ) -> dict[str, Any]:
     """
     Get a summary of fields available in an index, including field names,
@@ -5366,13 +5147,18 @@ def get_field_summary(
         earliest_time: Start of time range (default: -24h)
         latest_time: End of time range (default: now)
         max_values: Maximum distinct values to return per field (default: 10)
+        timeout_seconds: Maximum completion-wait seconds; None waits without a limit.
 
     Returns:
         Dictionary containing field summary with types and sample values
     """
     service = get_splunk_service()
 
+    job = None
+    response = {}
+
     try:
+        _validate_search_timeout(timeout_seconds)
         # Use fieldsummary command to get field information
         query = f'search index={index} | head 10000 | fieldsummary maxvals={max_values}'
         job = service.jobs.create(
@@ -5381,8 +5167,7 @@ def get_field_summary(
             latest_time=latest_time
         )
 
-        while not job.is_done():
-            pass
+        _wait_for_search_job(job, timeout_seconds)
 
         result_stream = job.results(count=0)
         reader = results.ResultsReader(result_stream)
@@ -5403,9 +5188,7 @@ def get_field_summary(
                     "values": result.get("values", "")
                 })
 
-        job.cancel()
-
-        return {
+        response = {
             "success": True,
             "index": index,
             "time_range": {"earliest": earliest_time, "latest": latest_time},
@@ -5414,11 +5197,15 @@ def get_field_summary(
         }
 
     except Exception as e:
-        return {
+        response = {
             "success": False,
             "error": str(e),
             "fields": []
         }
+    finally:
+        _cleanup_search_job(job, response, {'fields': []})
+
+    return response
 
 
 def main():

@@ -1,2 +1,2 @@
-mcp>=1.0.0
-splunk-sdk>=2.0.0
+mcp>=2.3.0,<3
+splunk-sdk>=2.1.1,<3
