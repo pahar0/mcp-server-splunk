@@ -43,6 +43,19 @@ jobs:
           python -m pip install --upgrade build twine
           python -m build
           python -m twine check --strict dist/*
+      - name: Check wheel archive paths
+        run: |
+          python - <<'PY'
+          from pathlib import Path, PurePosixPath
+          from zipfile import ZipFile
+
+          for wheel in Path("dist").glob("*.whl"):
+              with ZipFile(wheel) as archive:
+                  for name in archive.namelist():
+                      path = PurePosixPath(name)
+                      if path.is_absolute() or ".." in path.parts or path.as_posix() != name:
+                          raise SystemExit(f"Invalid wheel member path: {name}")
+          PY
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-distributions
